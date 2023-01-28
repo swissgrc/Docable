@@ -1,6 +1,13 @@
-# Docable
+# SwissGRC Docable Theme Fork For Statiq
 
-Documentation theme for Statiq Docs.
+Fork of the [Docable theme](https://github.com/statiqdev/Docable) for
+[Statiq Docs](https://www.statiq.dev/docs) for SwissGRC internal use.
+
+The `main` branch of the repository is updated which changes from
+[upstream repository](https://github.com/statiqdev/Docable).
+
+The `docs` branch (default branch) can contain additional features and fixes
+which are not yet merged to the upstream repository.
 
 # Minimum Statiq Docs Version
 
