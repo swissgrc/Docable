@@ -34,7 +34,7 @@
             </div>
         </div>
     }
-    if (editLink != null)
+    if (!string.IsNullOrWhiteSpace(editLink))
     {
         <p class="small font-weight-bold"><a href="@editLink" data-no-validate><i class="fad fa-pencil"></i> Edit This Page</a></p>
     }
