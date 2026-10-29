@@ -74,21 +74,119 @@
     // Pages titled like the query or containing it as exact phrase are ranked higher
     const PHRASE_BOOST = { exactTitle: 4, title: 3, text: 2 };
 
-    const lowerTexts = new WeakMap();
-
-    function lowerText(entry) {
-        if (!lowerTexts.has(entry)) {
-            lowerTexts.set(entry, normalize(entry.text));
-        }
-        return lowerTexts.get(entry);
-    }
-
     // Tries strict matching first and only relaxes it if nothing is found
     const STRATEGIES = [
         { combineWith: "AND" },
         { combineWith: "AND", fuzzy: term => term.length > 4 ? 0.2 : false },
         { combineWith: "OR", partial: true },
     ];
+
+    const textMaps = new WeakMap();
+    const textTokens = new WeakMap();
+
+    function normalizedTextWithMap(text) {
+        const normalizedParts = [];
+        const starts = [];
+        const ends = [];
+        const sourceToNormalized = new Array(text.length + 1);
+        let normalizedOffset = 0;
+
+        for (const chunkMatch of text.matchAll(/\S+|\s+/gu)) {
+            const chunk = chunkMatch[0];
+            const chunkStart = chunkMatch.index;
+            const normalizedChunk = normalize(chunk);
+            normalizedParts.push(normalizedChunk);
+            let sourceOffset = 0;
+
+            for (const character of chunk) {
+                const sourceStart = chunkStart + sourceOffset;
+                const sourceEnd = sourceStart + character.length;
+                const normalizedCharacter = normalize(character);
+                const normalizedStart = normalizedOffset;
+
+                for (let i = 0; i < character.length; i++) {
+                    sourceToNormalized[sourceStart + i] = normalizedStart;
+                }
+                normalizedOffset += normalizedCharacter.length;
+                sourceToNormalized[sourceEnd] = normalizedOffset;
+
+                if (normalizedCharacter.length > 0) {
+                    for (let i = normalizedStart; i < normalizedOffset; i++) {
+                        starts[i] = sourceStart;
+                        ends[i] = sourceEnd;
+                    }
+                } else if (starts.length > 0) {
+                    ends[ends.length - 1] = sourceEnd;
+                }
+                sourceOffset += character.length;
+            }
+        }
+
+        sourceToNormalized[text.length] = normalizedOffset;
+        return { text: normalizedParts.join(""), starts, ends, sourceToNormalized };
+    }
+
+    function indexedTokens(text) {
+        const tokens = [];
+        const add = (value, start) => {
+            let end = start + value.length;
+            while (end < text.length && /\p{M}/u.test(String.fromCodePoint(text.codePointAt(end)))) {
+                end += String.fromCodePoint(text.codePointAt(end)).length;
+            }
+            tokens.push({ start, end, normalized: normalize(value) });
+        };
+        const isLetterOrNumber = character => /[\p{L}\p{N}]/u.test(character);
+
+        for (const wordMatch of text.matchAll(/\S+/gu)) {
+            const word = wordMatch[0];
+            let compoundStart = 0;
+            let compoundEnd = word.length;
+            while (compoundStart < compoundEnd && !isLetterOrNumber(String.fromCodePoint(word.codePointAt(compoundStart)))) {
+                compoundStart += String.fromCodePoint(word.codePointAt(compoundStart)).length;
+            }
+            while (compoundEnd > compoundStart && !isLetterOrNumber(String.fromCodePoint(word.codePointAt(compoundEnd - 1)))) {
+                compoundEnd -= word.codePointAt(compoundEnd - 1) >= 0xDC00 && word.codePointAt(compoundEnd - 1) <= 0xDFFF ? 2 : 1;
+            }
+
+            const compound = word.slice(compoundStart, compoundEnd);
+            if (!compound) {
+                continue;
+            }
+            const absoluteStart = wordMatch.index + compoundStart;
+            add(compound, absoluteStart);
+
+            for (const partMatch of compound.matchAll(/[\p{L}\p{N}]+/gu)) {
+                const part = partMatch[0];
+                const partStart = absoluteStart + partMatch.index;
+                if (part !== compound) {
+                    add(part, partStart);
+                }
+                let subPartOffset = 0;
+                for (const subPart of part.split(CAMEL_CASE_BOUNDARY)) {
+                    const subPartStart = partStart + subPartOffset;
+                    if (subPart.length > 1 && subPart !== part) {
+                        add(subPart, subPartStart);
+                    }
+                    subPartOffset += subPart.length;
+                }
+            }
+        }
+        return tokens;
+    }
+
+    function entryTextMap(entry) {
+        if (!textMaps.has(entry)) {
+            textMaps.set(entry, normalizedTextWithMap(entry.text));
+        }
+        return textMaps.get(entry);
+    }
+
+    function entryTextTokens(entry) {
+        if (!textTokens.has(entry)) {
+            textTokens.set(entry, indexedTokens(entry.text));
+        }
+        return textTokens.get(entry);
+    }
 
     function createIndex(entries) {
         const index = new MiniSearch({
@@ -109,79 +207,117 @@
         return index;
     }
 
-    // Finds the position in the text where the phrase or most of the matched terms occur close together
-    function findBestMatch(text, phrase, terms) {
-        if (phrase && text.includes(phrase)) {
-            return text.indexOf(phrase);
-        }
-        const windowSize = 200;
-        let best = { position: -1, count: 0 };
-        for (const term of terms) {
-            let position = text.indexOf(term);
-            for (let i = 0; position >= 0 && i < 20; i++) {
-                const start = Math.max(0, position - windowSize / 2);
-                const nearby = text.slice(start, start + windowSize);
-                const count = terms.filter(t => nearby.includes(t)).length;
-                if (count > best.count) {
-                    best = { position, count };
+    // Finds the indexed token position where the phrase or most matched terms occur close together
+    function findBestMatch(textMap, phrase, terms, tokens) {
+        const text = textMap.text;
+        const termSet = new Set(terms);
+        const candidates = tokens
+            .filter(token => termSet.has(token.normalized))
+            .map(token => {
+                const normalizedPosition = textMap.sourceToNormalized[token.start];
+                const normalizedEnd = textMap.sourceToNormalized[token.end];
+                return {
+                    position: textMap.starts[normalizedPosition],
+                    end: textMap.ends[normalizedEnd - 1],
+                    normalizedPosition,
+                    normalizedEnd,
+                };
+            });
+
+        if (phrase) {
+            const phraseStart = text.indexOf(phrase);
+            if (phraseStart >= 0) {
+                const starts = new Set(tokens.map(token => textMap.sourceToNormalized[token.start]));
+                const ends = new Set(tokens.map(token => textMap.sourceToNormalized[token.end]));
+                const phraseEnd = phraseStart + phrase.length;
+                if (starts.has(phraseStart) && ends.has(phraseEnd)) {
+                    return {
+                        position: textMap.starts[phraseStart],
+                        end: textMap.ends[phraseEnd - 1],
+                        normalizedPosition: phraseStart,
+                        normalizedEnd: phraseEnd,
+                    };
                 }
-                position = text.indexOf(term, position + term.length);
             }
         }
-        return best.position;
+
+        const windowSize = 200;
+        let best = null;
+        for (const candidate of candidates) {
+            const nearbyTerms = new Set(candidates
+                .filter(other => Math.abs(other.normalizedPosition - candidate.normalizedPosition) < windowSize / 2)
+                .map(other => text.slice(other.normalizedPosition, other.normalizedEnd)));
+            if (!best || nearbyTerms.size > best.count) {
+                best = { ...candidate, count: nearbyTerms.size };
+            }
+        }
+        return best;
     }
 
     function escapeHtml(text) {
         return text.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" })[c]);
     }
 
-    function escapeRegExp(text) {
-        return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    }
-
     function highlight(text, terms) {
         if (terms.length === 0) {
             return escapeHtml(text);
         }
-        const pattern = new RegExp(terms.slice().sort((a, b) => b.length - a.length).map(escapeRegExp).join("|"), "gi");
+        const termSet = new Set(terms);
+        const matches = indexedTokens(text)
+            .filter(token => termSet.has(token.normalized))
+            .sort((a, b) => a.start - b.start || b.end - a.end);
         let html = "";
         let last = 0;
-        for (const match of text.matchAll(pattern)) {
-            html += escapeHtml(text.slice(last, match.index)) + "<mark>" + escapeHtml(match[0]) + "</mark>";
-            last = match.index + match[0].length;
+        let matchEnd = -1;
+        for (const match of matches) {
+            if (match.start < matchEnd) {
+                if (match.end > matchEnd) {
+                    html += escapeHtml(text.slice(matchEnd, match.end));
+                    matchEnd = match.end;
+                }
+                continue;
+            }
+            html += escapeHtml(text.slice(last, match.start)) + "<mark>" + escapeHtml(text.slice(match.start, match.end)) + "</mark>";
+            last = match.end;
+            matchEnd = match.end;
         }
         return html + escapeHtml(text.slice(last));
     }
 
     // Text fragment (https://developer.mozilla.org/en-US/docs/Web/URI/Fragment/Text_fragments) of the whole words
     // at the given position, so the browser scrolls to and highlights the match
-    function textFragment(text, position, length) {
+    function textFragment(text, position, end, normalizedText) {
         let start = position;
-        let end = position + length;
+        let fragmentEnd = end;
         while (start > 0 && !/\s/.test(text[start - 1])) {
             start--;
         }
-        while (end < text.length && !/\s/.test(text[end])) {
-            end++;
+        while (fragmentEnd < text.length && !/\s/.test(text[fragmentEnd])) {
+            fragmentEnd++;
         }
-        const word = trimPunctuation(text.slice(start, end));
-        return word ? ":~:text=" + encodeURIComponent(word).replace(/-/g, "%2D") : "";
+        const word = trimPunctuation(text.slice(start, fragmentEnd));
+        const normalizedWord = normalize(word);
+        if (!normalizedWord || normalizedText.indexOf(normalizedWord) !== normalizedText.lastIndexOf(normalizedWord)) {
+            return "";
+        }
+        return ":~:text=" + encodeURIComponent(word).replace(/-/g, "%2D");
     }
 
     function createResult(entry, searchResult, normalizedQuery, phrase) {
         // Single characters are only matched as part of compound words and would be highlighted everywhere
         const terms = Object.keys(searchResult.match).filter(term => term.length > 1);
-        const position = findBestMatch(lowerText(entry), phrase, terms);
+        const textMap = entryTextMap(entry);
+        const match = findBestMatch(textMap, phrase, terms, entryTextTokens(entry));
 
         let snippet = entry.text.slice(0, 200);
         let section = null;
         let fragment = "";
-        if (position >= 0) {
-            const start = Math.max(0, entry.text.lastIndexOf(" ", Math.max(0, position - 80)) + 1);
+        if (match) {
+            const start = Math.max(0, entry.text.lastIndexOf(" ", Math.max(0, match.position - 80)) + 1);
             const end = entry.text.indexOf(" ", Math.min(entry.text.length, start + 220));
             snippet = (start > 0 ? "… " : "") + entry.text.slice(start, end < 0 ? undefined : end) + (end < 0 ? "" : " …");
-            section = entry.sections.filter(s => s.offset <= position).pop() || null;
-            fragment = textFragment(entry.text, position, phrase && lowerText(entry).startsWith(phrase, position) ? phrase.length : 0);
+            section = entry.sections.filter(s => s.offset <= match.position).pop() || null;
+            fragment = textFragment(entry.text, match.position, match.end, textMap.text);
         }
 
         let score = searchResult.score;
@@ -189,7 +325,7 @@
             score *= PHRASE_BOOST.exactTitle;
         } else if (phrase && normalize(entry.title).includes(phrase)) {
             score *= PHRASE_BOOST.title;
-        } else if (phrase && lowerText(entry).includes(phrase)) {
+        } else if (phrase && textMap.text.includes(phrase)) {
             score *= PHRASE_BOOST.text;
         }
 
