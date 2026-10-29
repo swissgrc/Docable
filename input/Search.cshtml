@@ -1,90 +1,94 @@
 HideFromSearchIndex: true
-Excluded: => !Context.GetBool(WebKeys.GenerateSearchIndex)
 ShowInNavigation: false
 EditLink:
 ---
-<form>
+<form onsubmit="return false">
     <div class="form-group">
         <label for="search">Search Query</label>
-        <input class="form-control" type="search" aria-label="Search" id="search">
+        <input class="form-control" type="search" aria-label="Search" id="search" autocomplete="off">
     </div>
 </form>
 
+<p id="search-status" class="text-muted small"></p>
 <div id="search-results"></div>
 
 @section Scripts
 {
+    <script src="https://cdn.jsdelivr.net/npm/minisearch@7.2.0/dist/umd/index.min.js"></script>
+    <script src="@Context.GetLink("/assets/js/search.js")"></script>
     <script>
-        function runSearch(query) {
-            // Clear previous search results
-            $("#search-results").empty();
+        const maxResults = 50;
+        const searchInput = document.getElementById("search");
+        const searchStatus = document.getElementById("search-status");
+        const searchResults = document.getElementById("search-results");
+        let searchIndex = null;
+        let searchTimeout = null;
 
-            // If the search term is less than 2 characters, wait until the user types some more stuff
-            if (query.length < 2)
-            {
+        function runSearch() {
+            const query = searchInput.value.trim();
+
+            // Update the URL so that the user can come back to these results
+            const url = new URL(window.location.href);
+            if (query) {
+                url.searchParams.set("query", query);
+            } else {
+                url.searchParams.delete("query");
+            }
+            window.history.replaceState(null, "", url.href);
+
+            searchResults.innerHTML = "";
+            if (!searchIndex) {
                 return;
             }
 
-            // Update the URL so that the user can come back to these results
-            var url = new URL(window.location.href);
-            url.searchParams.set("query", query);
-            window.history.replaceState(url.href, "", url.href);
-
-            // Tell Lunr to run the search
-            search.search(query, function(results)
-            {
-                // Set up for scroll to text fragment on results links
-                // https://github.com/WICG/scroll-to-text-fragment
-                var highlight = "#:~:" + query.split(" ").map(term => {
-                    if(term.includes("^"))
-                        term = term.slice(0, term.indexOf("^"));
-                    if(term.includes("~"))
-                        term = term.slice(0, term.indexOf("~"));
-                    if(term.includes(":"))
-                        term = term.slice(term.indexOf(":")+1);
-                    return "text=" + term.replace("*", "").replace("+", "").replace("-", "");
-                }).join("&");
-
-                // Prepare output formatting
-                var listHtml = "<ul>";
-                if (results.length == 0)
-                {
-                    listHtml += "<li>No results found</li>";
-                }
-                else
-                {
-                    for (var i = 0; i < results.length; ++i)
-                    {
-                        var res = results[i];
-                        listHtml += `
-<div class="p-3 mb-2 bg-light page-box">
-    <h4><a href="${res.link}${highlight}">${res.title}</a></h4>
-    <div class="font-size-sm">${res.excerpt}</div>
-</div>
-`;
-                    }
-                }
-                listHtml += "</ul>";
-                $("#search-results").append(listHtml);
-            });            
-        }
-        $(document).ready(function() {
-            // Hook into changes on the search box
-            $("#search").on('input propertychange paste', function() {
-                runSearch($("#search").val());
-            });
-
-            // If the URL contains a search parameter, do that search now
-            const urlParams = new URLSearchParams(window.location.search);
-            const queryParam = urlParams.get('query');
-            if (queryParam) {
-                $("#search").val(queryParam);
-                runSearch($("#search").val());
+            // If the search term is less than 2 characters, wait until the user types some more stuff
+            if (query.length < 2) {
+                searchStatus.textContent = "";
+                return;
             }
 
-            // Focus the search box
-            let searchEl = document.getElementById("search");
-            searchEl.focus();
+            const { results, partial } = searchIndex.search(query);
+            if (results.length === 0) {
+                searchStatus.textContent = "No results found";
+                return;
+            }
+
+            searchStatus.textContent =
+                (partial ? "No page contains all search terms, showing pages containing some of them. " : "")
+                + `${results.length} result${results.length === 1 ? "" : "s"}`
+                + (results.length > maxResults ? `, showing the first ${maxResults}` : "");
+
+            searchResults.innerHTML = results.slice(0, maxResults).map(result => `
+<div class="p-3 mb-2 bg-light page-box">
+    <h4><a href="${result.link.replace(/"/g, "%22")}">${result.titleHtml}</a></h4>
+    ${result.sectionHtml ? `<div class="small text-muted mb-1">${result.sectionHtml}</div>` : ""}
+    ${result.api ? `<div class="small text-muted">API reference</div>` : `<div class="font-size-sm">${result.snippetHtml}</div>`}
+</div>
+`).join("");
+        }
+
+        searchInput.addEventListener("input", () => {
+            clearTimeout(searchTimeout);
+            searchTimeout = setTimeout(runSearch, 100);
         });
+
+        // If the URL contains a search parameter, show it until the search data is loaded
+        const queryParam = new URLSearchParams(window.location.search).get("query");
+        if (queryParam) {
+            searchInput.value = queryParam;
+        }
+        searchInput.focus();
+
+        searchStatus.textContent = "Loading search index…";
+        DocsSearch.load("@Context.GetLink("/search-data.json.gz")")
+            .then(index => {
+                searchIndex = index;
+                searchStatus.textContent = "";
+                runSearch();
+            })
+            .catch(error => {
+                console.error(error);
+                searchStatus.textContent = "The search index could not be loaded.";
+            });
     </script>
 }
