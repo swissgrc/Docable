@@ -47,18 +47,18 @@ EditLink:
                 return;
             }
 
-            const { results, partial } = searchIndex.search(query);
-            if (results.length === 0) {
+            const { results, total, partial } = searchIndex.search(query, maxResults);
+            if (total === 0) {
                 searchStatus.textContent = "No results found";
                 return;
             }
 
             searchStatus.textContent =
                 (partial ? "No page contains all search terms, showing pages containing some of them. " : "")
-                + `${results.length} result${results.length === 1 ? "" : "s"}`
-                + (results.length > maxResults ? `, showing the first ${maxResults}` : "");
+                + `${total} result${total === 1 ? "" : "s"}`
+                + (total > maxResults ? `, showing the first ${maxResults}` : "");
 
-            searchResults.innerHTML = results.slice(0, maxResults).map(result => `
+            searchResults.innerHTML = results.map(result => `
 <div class="p-3 mb-2 bg-light page-box">
     <h4><a href="${result.link.replace(/"/g, "%22")}">${result.titleHtml}</a></h4>
     ${result.sectionHtml ? `<div class="small text-muted mb-1">${result.sectionHtml}</div>` : ""}

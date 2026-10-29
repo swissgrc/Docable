@@ -135,23 +135,14 @@
             }
             tokens.push({ start, end, normalized: normalize(value) });
         };
-        const isLetterOrNumber = character => /[\p{L}\p{N}]/u.test(character);
 
         for (const wordMatch of text.matchAll(/\S+/gu)) {
             const word = wordMatch[0];
-            let compoundStart = 0;
-            let compoundEnd = word.length;
-            while (compoundStart < compoundEnd && !isLetterOrNumber(String.fromCodePoint(word.codePointAt(compoundStart)))) {
-                compoundStart += String.fromCodePoint(word.codePointAt(compoundStart)).length;
-            }
-            while (compoundEnd > compoundStart && !isLetterOrNumber(String.fromCodePoint(word.codePointAt(compoundEnd - 1)))) {
-                compoundEnd -= word.codePointAt(compoundEnd - 1) >= 0xDC00 && word.codePointAt(compoundEnd - 1) <= 0xDFFF ? 2 : 1;
-            }
-
-            const compound = word.slice(compoundStart, compoundEnd);
+            const compound = trimPunctuation(word);
             if (!compound) {
                 continue;
             }
+            const compoundStart = word.indexOf(compound);
             const absoluteStart = wordMatch.index + compoundStart;
             add(compound, absoluteStart);
 
@@ -221,8 +212,10 @@
                     end: textMap.ends[normalizedEnd - 1],
                     normalizedPosition,
                     normalizedEnd,
+                    term: text.slice(normalizedPosition, normalizedEnd),
                 };
-            });
+            })
+            .sort((a, b) => a.normalizedPosition - b.normalizedPosition);
 
         if (phrase) {
             const phraseStart = text.indexOf(phrase);
@@ -243,12 +236,33 @@
 
         const windowSize = 200;
         let best = null;
+        let left = 0;
+        let right = 0;
+        let distinctTerms = 0;
+        const termCounts = new Map();
         for (const candidate of candidates) {
-            const nearbyTerms = new Set(candidates
-                .filter(other => Math.abs(other.normalizedPosition - candidate.normalizedPosition) < windowSize / 2)
-                .map(other => text.slice(other.normalizedPosition, other.normalizedEnd)));
-            if (!best || nearbyTerms.size > best.count) {
-                best = { ...candidate, count: nearbyTerms.size };
+            const windowStart = candidate.normalizedPosition - windowSize / 2;
+            const windowEnd = candidate.normalizedPosition + windowSize / 2;
+            while (right < candidates.length && candidates[right].normalizedPosition < windowEnd) {
+                const term = candidates[right++].term;
+                const count = termCounts.get(term) || 0;
+                if (count === 0) {
+                    distinctTerms++;
+                }
+                termCounts.set(term, count + 1);
+            }
+            while (left < right && candidates[left].normalizedPosition <= windowStart) {
+                const term = candidates[left++].term;
+                const count = termCounts.get(term) - 1;
+                if (count === 0) {
+                    termCounts.delete(term);
+                    distinctTerms--;
+                } else {
+                    termCounts.set(term, count);
+                }
+            }
+            if (!best || distinctTerms > best.count) {
+                best = { ...candidate, count: distinctTerms };
             }
         }
         return best;
@@ -303,7 +317,19 @@
         return ":~:text=" + encodeURIComponent(word).replace(/-/g, "%2D");
     }
 
-    function createResult(entry, searchResult, normalizedQuery, phrase) {
+    function resultScore(entry, searchResult, normalizedQuery, phrase) {
+        let score = searchResult.score;
+        if (normalize(entry.title) === normalizedQuery) {
+            score *= PHRASE_BOOST.exactTitle;
+        } else if (phrase && normalize(entry.title).includes(phrase)) {
+            score *= PHRASE_BOOST.title;
+        } else if (phrase && normalize(entry.text).includes(phrase)) {
+            score *= PHRASE_BOOST.text;
+        }
+        return score;
+    }
+
+    function createResult(entry, searchResult, score, phrase) {
         // Single characters are only matched as part of compound words and would be highlighted everywhere
         const terms = Object.keys(searchResult.match).filter(term => term.length > 1);
         const textMap = entryTextMap(entry);
@@ -320,15 +346,6 @@
             fragment = textFragment(entry.text, match.position, match.end, textMap.text);
         }
 
-        let score = searchResult.score;
-        if (normalize(entry.title) === normalizedQuery) {
-            score *= PHRASE_BOOST.exactTitle;
-        } else if (phrase && normalize(entry.title).includes(phrase)) {
-            score *= PHRASE_BOOST.title;
-        } else if (phrase && textMap.text.includes(phrase)) {
-            score *= PHRASE_BOOST.text;
-        }
-
         const anchor = (section ? section.id : "") + fragment;
         return {
             link: entry.link + (anchor ? "#" + anchor : ""),
@@ -340,10 +357,10 @@
         };
     }
 
-    function search(index, entries, query) {
+    function search(index, entries, query, limit = 50) {
         const queries = parseQuery(query);
         if (queries.length === 0) {
-            return { results: [], partial: false };
+            return { results: [], total: 0, partial: false };
         }
         const words = query.split(/\s+/).map(trimPunctuation).filter(Boolean);
         const normalizedQuery = normalize(words.join(" "));
@@ -351,15 +368,23 @@
         for (const strategy of STRATEGIES) {
             const found = index.search({ combineWith: strategy.combineWith, queries }, strategy);
             if (found.length > 0) {
+                const ranked = found.map(searchResult => {
+                    const entry = entries[searchResult.id];
+                    return {
+                        entry,
+                        searchResult,
+                        score: resultScore(entry, searchResult, normalizedQuery, phrase),
+                    };
+                }).sort((a, b) => b.score - a.score);
                 return {
-                    results: found
-                        .map(searchResult => createResult(entries[searchResult.id], searchResult, normalizedQuery, phrase))
-                        .sort((a, b) => b.score - a.score),
+                    results: ranked.slice(0, limit).map(result =>
+                        createResult(result.entry, result.searchResult, result.score, phrase)),
+                    total: found.length,
                     partial: !!strategy.partial,
                 };
             }
         }
-        return { results: [], partial: false };
+        return { results: [], total: 0, partial: false };
     }
 
     async function load(url) {
